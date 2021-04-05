@@ -1,14 +1,8 @@
 cmake_minimum_required (VERSION 2.6)
 
-project (x3d)
+project (x3d-xrdesktop)
 set (x3d_VERSION_MAJOR 0)
 set (x3d_VERSION_MINOR 1)
-
-option (USE_HYDRA "Create the Hydra Modules" OFF)
-set (SIXENSE_PATH "${PROJECT_SOURCE_DIR}/../sixenseSDK_linux_OSX" CACHE PATH "Sixense SDK for Hydra")
-
-option (USE_OPENVR "Create the OpenVR Modules" OFF)
-set (OPENVR_PATH "${PROJECT_SOURCE_DIR}/../openvr" CACHE PATH "OpenVR")
 
 # set the default install to our binary directory
 #set (CMAKE_INSTALL_PREFIX "${PROJECT_BINARY_DIR}/release" CACHE PATH "install prefix" FORCE)
@@ -25,6 +19,13 @@ include_directories("${PROJECT_BINARY_DIR}")
 
 set (EXTRA_LIBS X11 GLEW GL Xdamage)
 
+include (FindPkgConfig)
+PKG_CHECK_MODULES (KWINXRDEPS REQUIRED
+    xrdesktop-0.15
+    graphene-1.0
+    libinputsynth-0.15
+)
+
 include_directories ("${PROJECT_SOURCE_DIR}/vertex")
 add_subdirectory (vertex)
 set (EXTRA_LIBS ${EXTRA_LIBS} vertex)
@@ -33,54 +34,23 @@ include_directories ("${PROJECT_SOURCE_DIR}/xman")
 add_subdirectory (xman)
 set (EXTRA_LIBS ${EXTRA_LIBS} xman)
 
-if (USE_HYDRA)
-  include_directories ("${PROJECT_SOURCE_DIR}/hydra")
-  add_subdirectory (hydra)
-  set (EXTRA_LIBS ${EXTRA_LIBS} hydra)
+add_executable (x3d-xrdesktop phasetest.cpp)
 
-  # link in the sixense library
-  if (CMAKE_SIZEOF_VOID_P MATCHES "8")
-    # 64 bit
-    link_directories ("${SIXENSE_PATH}/lib/linux_x64/release")
-    set (EXTRA_LIBS ${EXTRA_LIBS} sixense_x64)
-    install (FILES "${SIXENSE_PATH}/lib/linux_x64/release/libsixense_x64.so" DESTINATION bin)
-  else (CMAKE_SIZEOF_VOID_P MATCHES "8")
-    # 32 bit
-    link_directories ("${SIXENSE_PATH}/lib/linux/release")
-    set (EXTRA_LIBS ${EXTRA_LIBS} sixense)
-    install (FILES "${SIXENSE_PATH}/lib/linux/release/libsixense.so" DESTINATION bin)
-  endif (CMAKE_SIZEOF_VOID_P MATCHES "8")
-  # this is needed for some c++ symbols for some reason
-  set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--unresolved-symbols=ignore-in-shared-libs")
-endif (USE_HYDRA)
+target_link_libraries (x3d-xrdesktop
+  ${EXTRA_LIBS}
+  ${KWINXRDEPS_LIBRARIES}
+  ${KWINXRINPUTDEPS_LIBRARIES}
+)
 
-if (USE_OPENVR)
-  if (CMAKE_SIZEOF_VOID_P MATCHES "8")
-    link_directories ("${OPENVR_PATH}/lib/linux64")
-    install (FILES "${OPENVR_PATH}/lib/linux64/libopenvr_api.so" DESTINATION bin)
-  else (CMAKE_SIZEOF_VOID_P MATCHES "8")
-    link_directories ("${OPENVR_PATH}/lib/linux32")
-    install (FILES "${OPENVR_PATH}/lib/linux32/libopenvr_api.so" DESTINATION bin)
-  endif (CMAKE_SIZEOF_VOID_P MATCHES "8")
-  set (EXTRA_LIBS ${EXTRA_LIBS} openvr_api)
-  include_directories ("${OPENVR_PATH}/headers")
-endif (USE_OPENVR)
+message ("Include: ${KWINXRDEPS_INCLUDE_DIRS}")
+message ("Link: ${KWINXRDEPS_LIBRARIES}")
 
-add_executable (x3d phasetest.cpp)
+target_include_directories(x3d-xrdesktop PRIVATE
+    ${KWINXRDEPS_INCLUDE_DIRS}
+    ${KWINXRINPUTDEPS_INCLUDE_DIRS}
+)
 
-target_link_libraries (x3d ${EXTRA_LIBS})
-
-install (TARGETS x3d DESTINATION bin)
-install (FILES "${PROJECT_SOURCE_DIR}/run.sh"
-               "${PROJECT_SOURCE_DIR}/server.sh"
-               "${PROJECT_SOURCE_DIR}/debug.sh"
-               "${PROJECT_SOURCE_DIR}/cdebug.sh"
-               DESTINATION bin
-               PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
-install (FILES "${PROJECT_SOURCE_DIR}/action_manifest.json"
-               "${PROJECT_SOURCE_DIR}/bindings_generic.json"
-               "${PROJECT_SOURCE_DIR}/bindings_knuckles.json"
-               DESTINATION bin)
+install (TARGETS x3d-xrdesktop DESTINATION bin)
 
 add_test (x3dRuns x3d -display :9)
 

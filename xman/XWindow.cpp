@@ -41,6 +41,11 @@ XWindow::XWindow(Display * dpy, Window w, XWindow * next) : _matrix(Matrix::iden
 	_mapped = false;
 	_width = 0;
 	_height = 0;
+
+
+	if (!XFetchName(dpy, w, &name)) {
+		name = (char*) "UNKNOWN";
+	}
 }
 
 XWindow::~XWindow()

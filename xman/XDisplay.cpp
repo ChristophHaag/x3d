@@ -224,6 +224,8 @@ XWindow * XDisplay::GetWindow(Display * dpy, Window w)
 
 bool XDisplay::RemoveWindow(Window w)
 {
+	// TODO
+	return true;
 }
 
 void XDisplay::GetCross(XWindow * a, XWindow * b, Cross &cross)

@@ -20,15 +20,57 @@
 
 #include <sys/time.h>
 
-#if defined(USE_HYDRA)
-#include "Hydra.h"
-#elif defined(USE_OPENVR)
-#include <openvr.h>
-#endif
 #include "XWindow.h"
 #include "XDisplay.h"
 
+#include <iostream>
+
+// extern C around C headers prevents C++ linker from mangling symbol names
+extern "C" {
+#include <glib.h>
+#include <inputsynth.h>
+#include <gulkan.h>
+#include <xrd.h>
+}
+
 #define ESCAPE 9
+
+
+typedef struct {
+	XrdClient *xrdClient = NULL;
+	InputSynth *synth = NULL;
+
+	int cursorHotspotX = 0;
+	int cursorHotspotY = 0;
+
+	bool m_vrmirrorRunning = false;
+
+	guint64 clickSource;
+	guint64 moveSource;
+	guint64 keyboardSource;
+	guint64 quitSource;
+
+	int num_windows = 0;
+} Xrdesktop;
+
+class WindowWrapper
+{
+public:
+	WindowWrapper(XWindow *window)
+	: xwindow(window)
+	{
+		printf("New window %p %dx%d\n", window, window->x(), window->y());
+	}
+	XWindow *xwindow;
+
+	guint keyboardCharSignal = 0;
+	guint keyboardCloseSignal = 0;
+
+	int glTextureWidth = 0;
+	int glTextureHeight = 0;
+	GLuint offscreenGLTexture;
+};
+
 
 Display * g_gldpy;
 Window g_glwin;
@@ -1100,7 +1142,460 @@ void initializeWindows(Display * dpy)
 int OnXErrorEvent(Display * dpy, XErrorEvent * error)
 {
 	printf("had an error\n");
+	return 1;
 }
+
+/* Coordinate space: 0 == x: left, y == 0: top */
+static graphene_point_t _windowToDesktopCoordinates(WindowWrapper *vrWin,
+																										graphene_point_t *positionOnWindow)
+{
+	XWindow *xwindow = vrWin->xwindow;
+
+	graphene_point_t positionOnDesktop = {
+		xwindow->x() + positionOnWindow->x,
+		xwindow->y() + positionOnWindow->y
+	};
+	return positionOnDesktop;
+}
+
+static void _click_cb(XrdClient *client, XrdClickEvent *event, Xrdesktop *self)
+{
+	(void) client;
+	(void) self;
+	// g_print ("click: %f, %f\n", event->position->x, event->position->y);
+
+	XrdWindow *xrdWin = event->window;
+	WindowWrapper *vrWin;
+	g_object_get(xrdWin, "native", &vrWin, NULL);
+
+	if (!vrWin || !vrWin->xwindow)
+		return;
+
+	// TODO
+	//_ensure_on_workspace(vrWin->xwindow);
+
+	/* TODO
+	if (KWin::effects->activeWindow() != vrWin->kwinWindow) {
+		KWin::effects->activateWindow(vrWin->kwinWindow);
+	}
+	*/
+
+	graphene_point_t xy = _windowToDesktopCoordinates(vrWin, event->position);
+
+	std::cout << (event->state ? "Pressing " : "Releasing ") << " button " << event->button << "at"
+	<< xy.x << ", " << xy.y << std::endl;
+
+	input_synth_click(self->synth, xy.x, xy.y, event->button, event->state);
+}
+
+static guint64 last;
+static void _move_cursor_cb(XrdClient *client, XrdMoveCursorEvent *event, Xrdesktop *self)
+{
+	(void) client;
+	(void) self;
+	// g_print ("click: %f, %f\n", event->position->x, event->position->y);
+
+	if (event->ignore) {
+		printf("Ignored event");
+		return;
+	}
+
+	XrdWindow *xrdWin = event->window;
+	WindowWrapper *vrWin;
+	g_object_get(xrdWin, "native", &vrWin, NULL);
+
+	if (!vrWin || !vrWin->xwindow)
+		return;
+
+	// TODO
+	//_ensure_on_workspace(vrWin->kwinWindow);
+
+	/* TODO
+	if (KWin::effects->activeWindow() != vrWin->kwinWindow) {
+		KWin::effects->activateWindow(vrWin->kwinWindow);
+	}
+	*/
+
+	/* TODO
+	if (vrWin->kwinWindow->isUserMove() || vrWin->kwinWindow->isUserResize()) {
+		qDebug() << "Not moving mouse while user is moving or resizing window!";
+		return;
+	}
+	*/
+
+	graphene_point_t xy = _windowToDesktopCoordinates(vrWin, event->position);
+
+	guint64 now = g_get_monotonic_time();
+	// qDebug() << "Synth input after: " << (now - last) / 1000.;
+	last = now;
+	input_synth_move_cursor(self->synth, xy.x, xy.y);
+}
+
+static void _keyboard_press_cb(XrdClient *client, GdkEventKey *event, Xrdesktop *self)
+{
+	if (!xrd_client_get_keyboard_window(client)) {
+		printf("ERROR: No keyboard window!");
+		return;
+	}
+
+	XrdWindow *keyboardXrdWin = xrd_client_get_keyboard_window(client);
+	WindowWrapper *keyboardVrWin;
+	g_object_get(keyboardXrdWin, "native", &keyboardVrWin, NULL);
+
+	if (!keyboardVrWin || !keyboardVrWin->xwindow)
+		return;
+
+
+	// TODO
+	//_ensure_on_workspace(keyboardVrWin->kwinWindow);
+
+	/* TODO
+	if (KWin::effects->activeWindow() != keyboardVrWin->kwinWindow) {
+		KWin::effects->activateWindow(keyboardVrWin->kwinWindow);
+	}
+	*/
+
+	std::cout << "Keyboard Input:" << event->string << std::endl;
+	for (int i = 0; i < event->length; i++) {
+		input_synth_character(self->synth, event->string[i]);
+	}
+}
+
+static void _systemQuitCallback(XrdClient *xrdClient, GxrQuitEvent *event, Xrdesktop *self)
+{
+	(void) xrdClient;
+	g_print("Handling VR quit event\n");
+
+	GSettings *settings = xrd_settings_get_instance();
+	XrdClientMode defaultMode = (XrdClientMode) g_settings_get_enum(settings, "default-mode");
+
+	// don't toggle VR from this callback because it will return to xrdClient
+	switch (event->reason) {
+		case GXR_QUIT_SHUTDOWN: {
+			g_print("Quit event: Shutdown\n");
+		} break;
+		case GXR_QUIT_PROCESS_QUIT: {
+
+			/* When we are in scene mode OpenVR tells us that we quit */
+			if (XRD_IS_SCENE_CLIENT(self->xrdClient)) {
+				printf("Ignoring process quit because that's us!");
+			} else {
+				g_print("Quit event: Process quit\n");
+				if (defaultMode == XRD_CLIENT_MODE_SCENE) {
+				}
+			}
+		} break;
+		case GXR_QUIT_APPLICATION_TRANSITION: {
+			g_print("Quit event: Application transition\n");
+			if (defaultMode == XRD_CLIENT_MODE_SCENE) {
+			}
+		} break;
+	}
+}
+
+
+static XrdWindow *
+_toXrdWindow(Xrdesktop *self,
+																				 XWindow *w,
+																				 bool includeDeleted = false)
+{
+	/*
+	if (isExcludedFromMirroring(w))
+		return NULL;
+
+	if (self->onlyCurrentWorkspace && !w->isOnCurrentDesktop())
+		return NULL;
+	*/
+
+	XrdWindow *xrdWin = xrd_client_lookup_window(self->xrdClient, w);
+	return xrdWin;
+}
+
+#define pixelsPerMeter 450.
+void setPositionFromDesktop(XrdWindow *xrdWin)
+{
+	WindowWrapper *vrWin;
+	g_object_get(xrdWin, "native", &vrWin, NULL);
+	int desktopHeight = 1920;
+	int desktopWidth = 1080;
+
+	int x = vrWin->xwindow->x() + vrWin->xwindow->width() / 2;
+	int y = vrWin->xwindow->y() + vrWin->xwindow->height() / 2;
+
+	graphene_point3d_t point = {static_cast<float>(x / pixelsPerMeter),
+		static_cast<float>(y / pixelsPerMeter),
+		-8.0f + ((float) 1 /* TODO increase with window count */) / 3.f};
+
+		graphene_matrix_t transform;
+		graphene_matrix_init_translate(&transform, &point);
+
+		xrd_window_set_transformation(xrdWin, &transform);
+
+		xrd_window_set_reset_transformation(xrdWin, &transform);
+}
+
+
+extern "C" {
+	/* forward declared to avoid include mess */
+	extern void (*glXGetProcAddress(const GLubyte *procname))(void);
+	// pulled in through epoxy egl header: extern void (*eglGetProcAddress(const
+	// char *procname))(void);
+}
+typedef void *(*getProcAddressFunc)(const GLubyte *procname);
+
+static bool _load_gl_symbol(const char *name, void **func)
+{
+	getProcAddressFunc getProcAddress = nullptr;
+	if (true) {
+		getProcAddress = (getProcAddressFunc) &glXGetProcAddress;
+	} else {
+		printf("ERROR: Can only load function pointers on GLX or EGL!\n");
+		return false;
+	}
+
+	*func = getProcAddress((GLubyte *) name);
+
+	if (!*func) {
+		std::cout << "Error: Failed to resolve required GL symbol" << name << std::endl;
+		return false;
+	}
+	return TRUE;
+}
+
+static bool _loadGLExtPtrs()
+{
+	if (!_load_gl_symbol("glCreateMemoryObjectsEXT", (void **) &glCreateMemoryObjectsEXT))
+		return false;
+	if (!_load_gl_symbol("glMemoryObjectParameterivEXT", (void **) &glMemoryObjectParameterivEXT))
+		return false;
+	if (!_load_gl_symbol("glGetMemoryObjectParameterivEXT",
+		(void **) &glGetMemoryObjectParameterivEXT))
+		return false;
+	if (!_load_gl_symbol("glImportMemoryFdEXT", (void **) &glImportMemoryFdEXT))
+		return false;
+	if (!_load_gl_symbol("glTexStorageMem2DEXT", (void **) &glTexStorageMem2DEXT))
+		return false;
+	if (!_load_gl_symbol("glDeleteMemoryObjectsEXT", (void **) &glDeleteMemoryObjectsEXT))
+		return false;
+
+	return true;
+}
+
+static bool _glExtPtrsLoaded()
+{
+	return glCreateMemoryObjectsEXT != nullptr && glMemoryObjectParameterivEXT != nullptr
+	&& glGetMemoryObjectParameterivEXT != nullptr && glImportMemoryFdEXT != nullptr
+	&& glTexStorageMem2DEXT != nullptr && glDeleteMemoryObjectsEXT != nullptr;
+}
+
+/* returns a gulkanTexture AND updates the respective KWin::GLTexture inside vrWin */
+static GulkanTexture *_allocateTexture(XrdClient *xrdClient,
+																			 WindowWrapper *vrWin,
+																			 int width,
+																			 int height)
+{
+	std::cout << "Reallocationg GL texture for" << vrWin->xwindow->name << "---"
+	<< vrWin->glTextureWidth << "x" << vrWin->glTextureHeight << "->"
+	<< width << "x" << height << "GL Texture ID:"
+	<< vrWin->offscreenGLTexture << std::endl;
+
+	if (!_glExtPtrsLoaded()) {
+		_loadGLExtPtrs();
+
+		if (!_glExtPtrsLoaded()) {
+			printf("Failed to load GL functions!\n");
+			return NULL;
+		}
+	}
+
+	VkImageLayout layout = xrd_client_get_upload_layout(xrdClient);
+	GulkanClient *client = xrd_client_get_gulkan(xrdClient);
+	gsize size;
+	int fd;
+	VkExtent2D extent = { .width = static_cast<uint32_t>(width), .height = static_cast<uint32_t>(height) };
+	GulkanTexture *gkTexture
+	= gulkan_texture_new_export_fd(client, extent, VK_FORMAT_R8G8B8A8_SRGB, layout, &size, &fd);
+
+	GLuint glTexId;
+	glGenTextures(1, &glTexId);
+	glBindTexture(GL_TEXTURE_2D, glTexId);
+	glTexParameteri (GL_TEXTURE_2D,GL_TEXTURE_TILING_EXT, GL_OPTIMAL_TILING_EXT);
+	glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+	GLuint glExtMemObject = 0;
+	glCreateMemoryObjectsEXT(1, &glExtMemObject);
+	GLint glDedicatedMem = GL_TRUE;
+	glMemoryObjectParameterivEXT(glExtMemObject, GL_DEDICATED_MEMORY_OBJECT_EXT, &glDedicatedMem);
+	glGetMemoryObjectParameterivEXT(glExtMemObject, GL_DEDICATED_MEMORY_OBJECT_EXT, &glDedicatedMem);
+	glImportMemoryFdEXT(glExtMemObject, size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd);
+	glTexStorageMem2DEXT(GL_TEXTURE_2D, 1, GL_SRGB8_ALPHA8, width, height, glExtMemObject, 0);
+	glDeleteMemoryObjectsEXT(1, &glExtMemObject);
+
+	std::cout << "Imported vk memory size" << size << " from fd" << fd << "into OpenGL memory object"
+	<< glExtMemObject << std::endl;
+
+	if (vrWin->offscreenGLTexture) {
+		glDeleteTextures(1, &vrWin->offscreenGLTexture);
+	}
+	vrWin->offscreenGLTexture = glTexId;
+
+	return gkTexture;
+}
+
+void upload_window(Xrdesktop *self, XrdWindow *xrdWin)
+{
+	if (xrdWin == NULL) {
+		printf("Window null");
+		return;
+	}
+
+	if (!xrd_window_is_visible(xrdWin)) {
+		return;
+	}
+
+	WindowWrapper *vrWin;
+	g_object_get(xrdWin, "native", &vrWin, NULL);
+
+	// already closed
+	if (!vrWin->xwindow) {
+		return;
+	}
+
+	/* TODO
+	if (!isDamaged(this, vrWin->kwinWindow)) {
+		// qDebug() << "Skipping upload of undamaged" <<
+		// vrWin->kwinWindow->caption();
+		return;
+	}
+	*/
+
+
+
+	const int width = vrWin->xwindow->width();
+	const int height = vrWin->xwindow->height();
+
+	GulkanTexture *cached_texture = xrd_window_get_texture(xrdWin);
+	if (!vrWin->offscreenGLTexture || width != vrWin->glTextureWidth || height != vrWin->glTextureHeight) {
+		cached_texture = _allocateTexture(self->xrdClient, vrWin, width, height);
+		xrd_window_set_flip_y(xrdWin, true);
+
+		xrd_window_set_and_submit_texture(XRD_WINDOW(xrdWin), cached_texture);
+	} else {
+		xrd_window_submit_texture(XRD_WINDOW(xrdWin));
+	}
+}
+
+XrdWindow *
+mapWindow(Xrdesktop *self, XWindow *win, bool force)
+{
+	if (win->width() > 5 && win->height() > 5) {
+	} else {
+		std::cout << "Window too small, not adding:" << win->name << win->width() << "x"
+		<< win->height();
+		return NULL;
+	}
+
+	if (force) {
+	} else {
+		/* TODO
+		if (isExcludedFromMirroring(win)) {
+			qDebug() << win->caption() << "is one of the excluded classes, skipping...";
+			return NULL;
+		}
+
+		if (onlyCurrentWorkspace && !win->isOnCurrentDesktop()) {
+			qDebug() << "Not mirroring window on other workspace:" << win->caption();
+			return NULL;
+		}
+		*/
+	}
+
+	WindowWrapper *vrWin = new WindowWrapper(win);
+
+
+	bool isChild = false; // TODO isChildWindow(win);
+
+	/* The window that a modal/dialog/menu is created from should have been
+	 * activated. */
+
+	XWindow *parentWindow = NULL; // TODO KWin::effects->activeWindow();
+	bool isParentMirrored = false; // TODO isChild && !isExcludedFromMirroring(parentWindow) && _kwinWindowToXrdWindow(this, parentWindow) != NULL;
+	bool hasParent = parentWindow && isParentMirrored;
+
+	const char *window_title = win->name;
+
+	if (isChild && !hasParent) {
+		std::cout << "Warning:" << window_title
+		<< "should be child but has no parent, trying hovered window!" << std::endl;
+
+		XrdWindow *hoveredXrdWin = xrd_client_get_synth_hovered(self->xrdClient);
+		if (hoveredXrdWin && XRD_IS_WINDOW(hoveredXrdWin)) {
+			WindowWrapper *hoveredWindow = nullptr;
+			g_object_get(hoveredXrdWin, "native", &hoveredWindow, NULL);
+
+			if (hoveredWindow) {
+				printf("hovered window will be used as parent!");
+				parentWindow = hoveredWindow->xwindow;
+				hasParent = true;
+			}
+		}
+	}
+
+	const float ppm = 300;
+	XrdWindow *xrdWin = xrd_window_new_from_pixels(self->xrdClient,
+																								 window_title,
+																								win->width(),
+																								 win->height(),
+																								 ppm);
+	g_object_set(xrdWin, "native", vrWin, NULL);
+
+	xrd_client_add_window(self->xrdClient, xrdWin, !(isChild && hasParent), win);
+
+	if (isChild && hasParent) {
+		XrdWindow *parentXrdWin = _toXrdWindow(self, parentWindow);
+		WindowWrapper *parentVrWin = NULL;
+		if (XRD_IS_WINDOW(parentXrdWin)) {
+			g_object_get(parentXrdWin, "native", &parentVrWin, NULL);
+		}
+
+		/* each window only has one child window, chain this child window to the
+		 *        last existing child window of the parent window.
+		 *        TODO: does this cover all wayland cases? */
+		XrdWindowData *parent_data = xrd_window_get_data(parentXrdWin);
+		while (parent_data->child_window != NULL) {
+			parentXrdWin = parent_data->child_window->xrd_window;
+			g_object_get(parentXrdWin, "native", &parentVrWin, NULL);
+			parent_data = xrd_window_get_data(parentXrdWin);
+		}
+
+		/*
+		QRect parentGeometry = parentVrWin->kwinWindow->geometry();
+		QPoint parentCenter = parentGeometry.center();
+		QPoint childCenter = win->geometry().center();
+
+		QPoint offsetPoint = childCenter - parentCenter;
+
+		graphene_point_t offset = {static_cast<float>(offsetPoint.x()),
+			-static_cast<float>(offsetPoint.y())};
+			xrd_window_add_child(parentXrdWin, xrdWin, &offset);
+			qDebug() << "Adding child at" << childCenter << "to parent at" << parentCenter << ", diff "
+			<< offsetPoint;
+			*/
+	} else {
+		setPositionFromDesktop(xrdWin);
+	}
+
+	upload_window(self, xrdWin);
+
+	std::cout << "Created window" << win->name << std::endl;
+
+	return xrdWin;
+}
+
+
+
+
 
 
 int main(int argc, char **argv)
@@ -1108,9 +1603,6 @@ int main(int argc, char **argv)
 	int i;
 
 	printf("version %d.%d\n", x3d_VERSION_MAJOR, x3d_VERSION_MINOR);
-#if defined(USE_HYDRA)
-	printf("  using hydra module\n");
-#endif
 
 	Display * dpy;
 	const char * display_name = NULL;
@@ -1134,8 +1626,8 @@ int main(int argc, char **argv)
 	if (!display_name)
 	{
 		usage(argv[0]);
-		printf(" attempting default of :9\n");
-		display_name = ":9";
+		printf(" attempting default of :0\n");
+		display_name = ":0";
 	}
 
 	dpy = XOpenDisplay(display_name);
@@ -1169,15 +1661,73 @@ int main(int argc, char **argv)
 	glewExperimental = GL_TRUE;
 	glewInit();
 
-#if defined(USE_OPENVR)
-	vr::EVRInitError eError = vr::VRInitError_None;
-	pVR = vr::VR_Init( &eError, vr::VRApplication_Scene );
-	if ( eError != vr::VRInitError_None )
-	{
-		fprintf(stderr, "%d %s", eError, vr::VR_GetVRInitErrorAsEnglishDescription( eError ));
+
+
+	if (!xrd_settings_is_schema_installed()) {
+		printf("xrdesktop GSettings Schema not installed. Check your xrdesktop installation!");
 		return 1;
 	}
-#endif
+
+	GSettings *settings = xrd_settings_get_instance();
+	XrdClientMode mode = (XrdClientMode) g_settings_get_enum(settings, "default-mode");
+
+	if (mode == XRD_CLIENT_MODE_SCENE) {
+		GxrApi api = (GxrApi) g_settings_get_enum(settings, "default-api");
+
+		gboolean scene_available = true;
+
+		// OpenVR: NULL when SteamVR is not running
+		GxrContext* gxr_context = gxr_context_new_headless_from_api(api, (char*)"xrdesktop on kwin", 1);
+		if (gxr_context != NULL) {
+			scene_available = !gxr_context_is_another_scene_running(gxr_context);
+			g_object_unref(gxr_context);
+		}
+
+		if (!scene_available) {
+			mode = XRD_CLIENT_MODE_OVERLAY;
+			printf("Scene mode unavailable. Launching in overlay mode.");
+		}
+	}
+
+	Xrdesktop xrd = {};
+	Xrdesktop *self = &xrd;
+
+	if (mode == XRD_CLIENT_MODE_SCENE) {
+		self->xrdClient = xrd_client_new_with_mode(mode);
+	} else {
+		self->xrdClient = xrd_client_new_with_mode(mode);
+	}
+	if (!self->xrdClient) {
+		printf("Failed to initialize xrdesktop!");
+		printf("Usually this is caused by a problem with the VR runtime.");
+		return 1;
+	}
+
+	self->synth = INPUT_SYNTH(input_synth_new(INPUTSYNTH_BACKEND_XDO));
+	if (!self->synth) {
+		printf("Failed to initialize input synth");
+		return 1;
+	}
+
+	self->clickSource = g_signal_connect(self->xrdClient,
+																			 "click-event",
+																			(GCallback) _click_cb,
+																			 self);
+	self->moveSource = g_signal_connect(self->xrdClient,
+																			"move-cursor-event",
+																		 (GCallback) _move_cursor_cb,
+																			self);
+	self->keyboardSource = g_signal_connect(self->xrdClient,
+																					"keyboard-press-event",
+																				 (GCallback) _keyboard_press_cb,
+																					self);
+	self->quitSource = g_signal_connect(self->xrdClient,
+																			"request-quit-event",
+																		 (GCallback) _systemQuitCallback,
+																			self);
+
+
+
 
 	InitGL(640, 480);
 
@@ -1185,7 +1735,7 @@ int main(int argc, char **argv)
 
 	Window root = DefaultRootWindow(dpy);
 	g_root = root;
-	DumpWindow(dpy, root, 1);
+	//DumpWindow(dpy, root, 1);
 #if 0
 	for (int i = 0; i < 256; i++)
 	{
@@ -1218,9 +1768,11 @@ int main(int argc, char **argv)
 			XSetInputFocus(dpy, child->w(), RevertToParent, CurrentTime);
 			g_mouse_focus = child->w();
 			g_kb_focus = child->w();
+
 		}
 		child->matrix().translation() -= Vector3(0.5f * child->width(), -0.5f * child->height(), 0);
 	}
+	//mapWindow(self, child, false);
 
 #if defined(USE_HYDRA) || defined(USE_OPENVR)
 	if (!vrInit())

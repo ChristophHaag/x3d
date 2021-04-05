@@ -71,6 +71,9 @@ public:
 	void SendCrossingEvent(Window root, int x, int y, int state, int detail, Window child, bool enter);
 	void SendButtonEvent(Window root, int x, int y, int button, int state, bool press);
 	void SendKeyEvent(Window root, int key, int state, bool press);
+
+
+  char *name;
 };
 
 #endif//XWindow_H
